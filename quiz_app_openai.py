@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
-
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 app = FastAPI(title="Oqumi Question Generator API (OpenAI)")
 
 
