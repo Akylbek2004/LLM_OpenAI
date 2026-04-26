@@ -238,12 +238,7 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
         if q_type not in {"single", "multiple", "ordering"}:
             q_type = "single"
 
-        score = q.get("score", 2)
-        try:
-            score = int(score)
-        except Exception:
-            score = 2
-        score = max(1, min(5, score))
+        score = 1
 
         content = q.get("content")
         if not isinstance(content, list) or not content:
@@ -430,7 +425,7 @@ class OpenAIQuestionService:
         {{ "id": 3, "content": [{{ "type": "text", "value": "Вариант 4" }}] }}
       ],
       "correct": [0],
-      "score": 2,
+      "score": 1,
       "explanation": "Осмысленное объяснение"
     }}
   ]
