@@ -13,7 +13,7 @@ app = FastAPI(title="Oqumi Question Generator API (OpenAI)")
 
 
 class GenerateQuestionsRequest(BaseModel):
-    lesson_text: str
+    lesson_text: dict
     questions_count: int = Field(default=3, ge=1, le=10)
     title_hint: Optional[str] = None
 
@@ -238,7 +238,12 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
         if q_type not in {"single", "multiple", "ordering"}:
             q_type = "single"
 
-        score = 1
+        score = q.get("score", 2)
+        try:
+            score = int(score)
+        except Exception:
+            score = 2
+        score = max(1, min(5, score))
 
         content = q.get("content")
         if not isinstance(content, list) or not content:
@@ -425,7 +430,7 @@ class OpenAIQuestionService:
         {{ "id": 3, "content": [{{ "type": "text", "value": "Вариант 4" }}] }}
       ],
       "correct": [0],
-      "score": 1,
+      "score": 2,
       "explanation": "Осмысленное объяснение"
     }}
   ]
@@ -515,8 +520,11 @@ def health():
 def generate_questions(quiz_id: int, payload: GenerateQuestionsRequest):
     try:
         service = OpenAIQuestionService()
+
+        lesson_text = json.dumps(payload.lesson_text, ensure_ascii=False)
+
         return service.generate_questions(
-            lesson_text=payload.lesson_text,
+            lesson_text=lesson_text,
             questions_count=payload.questions_count,
             title_hint=payload.title_hint,
             quiz_id=quiz_id,
