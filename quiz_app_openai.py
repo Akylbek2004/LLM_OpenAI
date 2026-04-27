@@ -1,3 +1,4 @@
+import ast
 import os
 import json
 from typing import List, Optional, Literal
@@ -18,74 +19,52 @@ class GenerateQuestionsRequest(BaseModel):
     title_hint: Optional[str] = None
 
 
-class ContentItem(BaseModel):
-    type: Literal["text", "code", "image"]
-    value: Optional[str] = None
-    lang: Optional[str] = None
-    url: Optional[str] = None
-    alt: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_content(self):
-        if self.type == "text" and not self.value:
-            raise ValueError("Для content.type='text' нужно поле value")
-        if self.type == "code":
-            if not self.value:
-                raise ValueError("Для content.type='code' нужно поле value")
-            if not self.lang:
-                self.lang = "text"
-        if self.type == "image" and not self.url:
-            raise ValueError("Для content.type='image' нужно поле url")
-        return self
-
-
-class OptionItem(BaseModel):
-    id: int
-    content: List[ContentItem]
-
-    @model_validator(mode="after")
-    def validate_option(self):
-        if not self.content:
-            raise ValueError("У option.content должен быть хотя бы 1 элемент")
-        return self
-
-
 class QuestionItem(BaseModel):
     type: Literal["single", "multiple", "ordering"]
-    content: List[ContentItem]
-    options: List[OptionItem]
+    text: str
+    options: List[str]
     correct: List[int]
-    score: int = Field(ge=1, le=5)
+    score: int = Field(default=1, ge=1, le=5)
     explanation: str
 
     @model_validator(mode="after")
     def validate_question(self):
-        if not self.content:
-            raise ValueError("У question.content должен быть хотя бы 1 элемент")
+        if not self.text or not self.text.strip():
+            raise ValueError("У question.text должен быть текст")
 
-        option_ids = [opt.id for opt in self.options]
-        if len(option_ids) != len(set(option_ids)):
-            raise ValueError("У options должны быть уникальные id")
+        if not self.explanation or not self.explanation.strip():
+            raise ValueError("У question.explanation должен быть текст")
+
+        if not self.options:
+            raise ValueError("У question.options должен быть массив вариантов")
+
+        for option in self.options:
+            if not isinstance(option, str) or not option.strip():
+                raise ValueError("Каждый option должен быть непустой строкой")
+
+        option_ids = list(range(len(self.options)))
 
         for cid in self.correct:
             if cid not in option_ids:
-                raise ValueError(f"correct содержит id={cid}, которого нет в options")
+                raise ValueError(f"correct содержит индекс={cid}, которого нет в options")
 
         if self.type == "single":
             if len(self.options) != 4:
                 raise ValueError("Для type='single' должно быть ровно 4 варианта")
             if len(self.correct) != 1:
-                raise ValueError("Для type='single' correct должен содержать ровно 1 id")
+                raise ValueError("Для type='single' correct должен содержать ровно 1 индекс")
 
         elif self.type == "multiple":
             if len(self.options) != 4:
                 raise ValueError("Для type='multiple' должно быть ровно 4 варианта")
             if len(self.correct) < 2:
-                raise ValueError("Для type='multiple' correct должен содержать минимум 2 id")
+                raise ValueError("Для type='multiple' correct должен содержать минимум 2 индекса")
 
         elif self.type == "ordering":
+            if len(self.options) < 2:
+                raise ValueError("Для type='ordering' должно быть минимум 2 варианта")
             if len(self.correct) != len(self.options):
-                raise ValueError("Для type='ordering' correct должен содержать порядок всех option id")
+                raise ValueError("Для type='ordering' correct должен содержать порядок всех индексов options")
 
         return self
 
@@ -93,16 +72,6 @@ class QuestionItem(BaseModel):
 class QuestionsResponse(BaseModel):
     quiz_id: int
     questions: List[QuestionItem]
-
-
-def safe_text_content(value: str) -> dict:
-    return {
-        "type": "text",
-        "value": value,
-        "lang": None,
-        "url": None,
-        "alt": None,
-    }
 
 
 def normalize_text(value: str) -> str:
@@ -134,16 +103,83 @@ def bad_explanation(text: str) -> bool:
     return t in bad_values or len(t) < 12
 
 
-def extract_text_from_option(option: dict) -> str:
-    content = option.get("content", [])
+def extract_text_from_stringified_object(value: str) -> str:
+    """Если в text/value случайно пришла строка вида "{'id': 0, 'text': 'SELECT'}", берём только text."""
+    if not isinstance(value, str):
+        return ""
+
+    cleaned = value.strip()
+    if not cleaned:
+        return ""
+
+    if not (cleaned.startswith("{") and cleaned.endswith("}")):
+        return cleaned
+
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        try:
+            parsed = ast.literal_eval(cleaned)
+        except Exception:
+            return cleaned
+
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("text"), str):
+            return parsed["text"].strip()
+        if isinstance(parsed.get("value"), str):
+            return parsed["value"].strip()
+
+    return cleaned
+
+
+def extract_text_from_content(content) -> str:
+    if not isinstance(content, list):
+        return ""
+
     parts = []
     for item in content:
-        if isinstance(item, dict) and item.get("type") == "text" and item.get("value"):
-            parts.append(str(item["value"]))
+        if isinstance(item, dict):
+            value = item.get("text") or item.get("value") or ""
+            value = extract_text_from_stringified_object(str(value))
+            if value:
+                parts.append(value)
+        elif isinstance(item, str):
+            value = extract_text_from_stringified_object(item)
+            if value:
+                parts.append(value)
+
     return " ".join(parts).strip()
 
 
-def normalize_option(option, fallback_id: int):
+def extract_question_text(question: dict, fallback_text: str) -> str:
+    if isinstance(question.get("text"), str) and question["text"].strip():
+        return extract_text_from_stringified_object(question["text"])
+
+    content_text = extract_text_from_content(question.get("content"))
+    if content_text:
+        return content_text
+
+    return fallback_text
+
+
+def extract_text_from_option(option: dict) -> str:
+    if not isinstance(option, dict):
+        return ""
+
+    if isinstance(option.get("text"), str) and option["text"].strip():
+        return extract_text_from_stringified_object(option["text"])
+
+    if isinstance(option.get("value"), str) and option["value"].strip():
+        return extract_text_from_stringified_object(option["value"])
+
+    content_text = extract_text_from_content(option.get("content"))
+    if content_text:
+        return content_text
+
+    return ""
+
+
+def normalize_option(option, fallback_id: int) -> dict:
     if isinstance(option, dict):
         option_id = option.get("id", fallback_id)
         try:
@@ -151,41 +187,16 @@ def normalize_option(option, fallback_id: int):
         except Exception:
             option_id = fallback_id
 
-        content = option.get("content")
+        option_text = extract_text_from_option(option)
+        if option_text:
+            return {"id": option_id, "value": option_text}
 
-        if isinstance(content, list) and content:
-            repaired_content = []
-            for item in content:
-                if isinstance(item, dict):
-                    repaired_content.append({
-                        "type": item.get("type", "text"),
-                        "value": item.get("value"),
-                        "lang": item.get("lang"),
-                        "url": item.get("url"),
-                        "alt": item.get("alt"),
-                    })
-                elif isinstance(item, str):
-                    repaired_content.append(safe_text_content(item))
+    elif isinstance(option, str):
+        option_text = extract_text_from_stringified_object(option)
+        if option_text:
+            return {"id": fallback_id, "value": option_text}
 
-            if repaired_content:
-                return {"id": option_id, "content": repaired_content}
-
-        if isinstance(option.get("value"), str):
-            return {
-                "id": option_id,
-                "content": [safe_text_content(option["value"])]
-            }
-
-    if isinstance(option, str):
-        return {
-            "id": fallback_id,
-            "content": [safe_text_content(option)]
-        }
-
-    return {
-        "id": fallback_id,
-        "content": [safe_text_content(str(option))]
-    }
+    return {"id": fallback_id, "value": f"Вариант {fallback_id + 1}"}
 
 
 def infer_correct_from_explanation(q_type: str, repaired_options: list, explanation: str) -> list:
@@ -194,10 +205,10 @@ def infer_correct_from_explanation(q_type: str, repaired_options: list, explanat
         return []
 
     matched_ids = []
-    for opt in repaired_options:
-        opt_text = normalize_text(extract_text_from_option(opt))
-        if opt_text and opt_text in explanation_text:
-            matched_ids.append(opt["id"])
+    for idx, opt_text in enumerate(repaired_options):
+        opt_text_norm = normalize_text(opt_text)
+        if opt_text_norm and opt_text_norm in explanation_text:
+            matched_ids.append(idx)
 
     matched_ids = unique_keep_order(matched_ids)
 
@@ -209,17 +220,15 @@ def infer_correct_from_explanation(q_type: str, repaired_options: list, explanat
 
 
 def build_fallback_explanation(q_type: str, repaired_options: list, correct: list) -> str:
-    option_map = {opt["id"]: opt for opt in repaired_options}
-
     if q_type == "single":
-        texts = [extract_text_from_option(option_map[cid]) for cid in correct if cid in option_map]
+        texts = [repaired_options[cid] for cid in correct if 0 <= cid < len(repaired_options)]
         return f"Правильный ответ: {', '.join(texts)}." if texts else "Правильный ответ определён на основе учебного текста."
 
     if q_type == "multiple":
-        texts = [extract_text_from_option(option_map[cid]) for cid in correct if cid in option_map]
+        texts = [repaired_options[cid] for cid in correct if 0 <= cid < len(repaired_options)]
         return f"Правильные варианты: {', '.join(texts)}." if texts else "Правильные варианты определены на основе учебного текста."
 
-    ordered = [extract_text_from_option(option_map[cid]) for cid in correct if cid in option_map]
+    ordered = [repaired_options[cid] for cid in correct if 0 <= cid < len(repaired_options)]
     return f"Правильный порядок: {' -> '.join(ordered)}." if ordered else "Правильный порядок определён на основе учебного текста."
 
 
@@ -238,52 +247,39 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
         if q_type not in {"single", "multiple", "ordering"}:
             q_type = "single"
 
+        question_text = extract_question_text(q, fallback_text=f"Вопрос {q_index + 1}")
         score = 1
 
-        content = q.get("content")
-        if not isinstance(content, list) or not content:
-            if isinstance(q.get("text"), str) and q.get("text").strip():
-                content = [safe_text_content(q["text"].strip())]
-            else:
-                content = [safe_text_content(f"Вопрос {q_index + 1}")]
-        else:
-            repaired_content = []
-            for item in content:
-                if isinstance(item, dict):
-                    repaired_content.append({
-                        "type": item.get("type", "text"),
-                        "value": item.get("value"),
-                        "lang": item.get("lang"),
-                        "url": item.get("url"),
-                        "alt": item.get("alt"),
-                    })
-                elif isinstance(item, str) and item.strip():
-                    repaired_content.append(safe_text_content(item.strip()))
-            content = repaired_content or [safe_text_content(f"Вопрос {q_index + 1}")]
-
         raw_options = q.get("options", [])
-        repaired_options = []
+        normalized_option_objects = []
 
         if isinstance(raw_options, list):
-            repaired_options = [normalize_option(opt, idx) for idx, opt in enumerate(raw_options)]
+            normalized_option_objects = [normalize_option(opt, idx) for idx, opt in enumerate(raw_options)]
 
         if q_type in {"single", "multiple"}:
-            while len(repaired_options) < 4:
-                repaired_options.append({
-                    "id": len(repaired_options),
-                    "content": [safe_text_content(f"Вариант {len(repaired_options) + 1}")]
+            while len(normalized_option_objects) < 4:
+                normalized_option_objects.append({
+                    "id": len(normalized_option_objects),
+                    "value": f"Вариант {len(normalized_option_objects) + 1}",
                 })
-            repaired_options = repaired_options[:4]
+            normalized_option_objects = normalized_option_objects[:4]
 
-        repaired_options = [
-            {
-                "id": idx,
-                "content": opt.get("content", [safe_text_content(f"Вариант {idx + 1}")])
-            }
-            for idx, opt in enumerate(repaired_options)
-        ]
+        elif q_type == "ordering":
+            while len(normalized_option_objects) < 2:
+                normalized_option_objects.append({
+                    "id": len(normalized_option_objects),
+                    "value": f"Элемент {len(normalized_option_objects) + 1}",
+                })
 
-        option_map = {opt["id"]: opt for opt in repaired_options}
+        old_id_to_new_id = {}
+        repaired_options = []
+        for new_id, opt in enumerate(normalized_option_objects):
+            old_id_to_new_id[opt["id"]] = new_id
+            repaired_options.append(
+                opt.get("value") or opt.get("text") or f"Вариант {new_id + 1}"
+            )
+
+        option_ids = set(range(len(repaired_options)))
 
         correct = q.get("correct")
         if not isinstance(correct, list):
@@ -293,7 +289,9 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
         for c in correct:
             try:
                 c_int = int(c)
-                if c_int in option_map:
+                if c_int in old_id_to_new_id:
+                    normalized_correct.append(old_id_to_new_id[c_int])
+                elif c_int in option_ids:
                     normalized_correct.append(c_int)
             except Exception:
                 pass
@@ -305,10 +303,9 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
             if isinstance(correct_answer, str) and correct_answer.strip():
                 correct_answer_norm = normalize_text(correct_answer)
                 matched_ids = []
-                for opt in repaired_options:
-                    opt_text = normalize_text(extract_text_from_option(opt))
-                    if opt_text == correct_answer_norm:
-                        matched_ids.append(opt["id"])
+                for idx, opt_text in enumerate(repaired_options):
+                    if normalize_text(opt_text) == correct_answer_norm:
+                        matched_ids.append(idx)
                 if matched_ids:
                     correct = matched_ids[:1]
 
@@ -327,39 +324,39 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
             if len(explanation_based_correct) == 1:
                 correct = explanation_based_correct
             elif len(correct) != 1:
-                correct = [repaired_options[0]["id"]] if repaired_options else [0]
+                correct = [0] if repaired_options else [0]
 
         elif q_type == "multiple":
             if len(explanation_based_correct) >= 2:
                 correct = explanation_based_correct
             elif len(correct) < 2:
                 if len(repaired_options) >= 2:
-                    correct = [repaired_options[0]["id"], repaired_options[1]["id"]]
+                    correct = [0, 1]
                 elif len(repaired_options) == 1:
-                    correct = [repaired_options[0]["id"]]
+                    correct = [0]
 
         elif q_type == "ordering":
             if len(correct) != len(repaired_options):
                 explanation_text = normalize_text(explanation)
                 ordered_ids = []
-                for opt in repaired_options:
-                    opt_text = normalize_text(extract_text_from_option(opt))
-                    pos = explanation_text.find(opt_text) if opt_text else -1
+                for idx, opt_text in enumerate(repaired_options):
+                    opt_text_norm = normalize_text(opt_text)
+                    pos = explanation_text.find(opt_text_norm) if opt_text_norm else -1
                     if pos >= 0:
-                        ordered_ids.append((pos, opt["id"]))
+                        ordered_ids.append((pos, idx))
 
                 if len(ordered_ids) == len(repaired_options):
                     ordered_ids.sort(key=lambda x: x[0])
                     correct = [item[1] for item in ordered_ids]
                 else:
-                    correct = [opt["id"] for opt in repaired_options]
+                    correct = list(range(len(repaired_options)))
 
         if bad_explanation(explanation):
             explanation = build_fallback_explanation(q_type, repaired_options, correct)
 
         repaired_questions.append({
             "type": q_type,
-            "content": content,
+            "text": question_text,
             "options": repaired_options,
             "correct": correct,
             "score": score,
@@ -370,12 +367,12 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
         idx = len(repaired_questions) + 1
         repaired_questions.append({
             "type": "single",
-            "content": [safe_text_content(f"Вопрос {idx}")],
+            "text": f"Вопрос {idx}",
             "options": [
-                {"id": 0, "content": [safe_text_content("Вариант 1")]},
-                {"id": 1, "content": [safe_text_content("Вариант 2")]},
-                {"id": 2, "content": [safe_text_content("Вариант 3")]},
-                {"id": 3, "content": [safe_text_content("Вариант 4")]},
+                "Вариант 1",
+                "Вариант 2",
+                "Вариант 3",
+                "Вариант 4",
             ],
             "correct": [0],
             "score": 1,
@@ -384,7 +381,7 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
 
     return {
         "quiz_id": quiz_id,
-        "questions": repaired_questions
+        "questions": repaired_questions,
     }
 
 
@@ -401,11 +398,11 @@ class OpenAIQuestionService:
         title_hint_text = f"\nТема: {title_hint}\n" if title_hint else ""
 
         return f"""
-Ты создаёшь учебные тесты по тексту.
+Ты создаёшь учебные тесты по учебному тексту.
 
 Нужно сгенерировать ровно {questions_count} вопросов.
 
-Разрешённые типы:
+Разрешённые типы вопросов:
 - "single"
 - "multiple"
 - "ordering"
@@ -415,47 +412,72 @@ class OpenAIQuestionService:
   "questions": [
     {{
       "type": "single",
-      "content": [
-        {{ "type": "text", "value": "Текст вопроса" }}
-      ],
+      "text": "Текст вопроса",
       "options": [
-        {{ "id": 0, "content": [{{ "type": "text", "value": "Вариант 1" }}] }},
-        {{ "id": 1, "content": [{{ "type": "text", "value": "Вариант 2" }}] }},
-        {{ "id": 2, "content": [{{ "type": "text", "value": "Вариант 3" }}] }},
-        {{ "id": 3, "content": [{{ "type": "text", "value": "Вариант 4" }}] }}
+        "Вариант 1",
+        "Вариант 2",
+        "Вариант 3",
+        "Вариант 4"
       ],
-      "correct": [0],
+      "correct": [1],
       "score": 1,
-      "explanation": "Осмысленное объяснение"
+      "explanation": "Осмысленное объяснение правильного ответа"
     }}
   ]
 }}
 
 Правила:
-1. Все вопросы должны быть только по учебному тексту.
-2. Не придумывай факты, которых нет в тексте.
-3. Не используй абсурдные или случайные варианты.
-4. Не смешивай языки.
-5. explanation должен быть осмысленным и не пустым.
-6. Не используй шаблонные explanation вроде "Options", "Explanation", "Краткое объяснение".
-7. correct должен точно соответствовать правильным option.id.
-8. Если type="single", correct должен содержать ровно один id.
-9. Если type="multiple", укажи все правильные варианты.
-10. Если type="ordering", correct должен содержать правильный порядок option.id.
-11. Не повторяй одинаковые вопросы.
-12. Верни только JSON без markdown и комментариев.
-13. Перед возвратом JSON обязательно проверь, что поле correct точно соответствует правильным option.id.
-14. explanation должен объяснять именно те варианты, которые указаны в correct.
-15. Если type="multiple", укажи все правильные варианты, а не только часть.
-16. Если type="single", правильный ответ должен быть однозначным и явно присутствовать среди options.
-17. Не возвращай шаблонные explanation вроде "Options", "Explanation", "Краткое объяснение".
-18. Для type="multiple" explanation должен перечислять именно все правильные варианты и не включать неправильные.
-19. Для type="ordering" в options должны быть только элементы, которые действительно участвуют в порядке.
-20. Для type="ordering" не добавляй лишний вариант, который не входит в правильную последовательность.
-21. Если нельзя составить качественный ordering-вопрос без лишнего варианта, лучше создай single или multiple.
-22. Если explanation говорит, что вариант неправильный, не включай его в correct.
-23. Не ставь correct всегда [0]. Правильный вариант должен быть на разных позициях: 0, 1, 2 или 3.
-24. Перемешивай options так, чтобы правильный ответ не всегда был первым.
+1. Верни только JSON без markdown, без комментариев и без дополнительного текста.
+2. Количество вопросов должно быть ровно {questions_count}.
+3. Все вопросы должны быть только по учебному тексту.
+4. Не придумывай факты, которых нет в учебном тексте.
+5. Не используй абсурдные, случайные или слишком очевидно неправильные варианты.
+6. Не смешивай языки.
+7. Не используй поля content, value, lang, url, alt.
+8. Не используй Tiptap-структуру.
+9. Для текста вопроса используй только поле "text".
+10. options должен быть массивом строк.
+11. Не используй id, text или value внутри options.
+12. У каждого single/multiple вопроса должно быть ровно 4 варианта ответа.
+13. correct должен содержать индексы правильных вариантов из массива options.
+14. Индексы в correct начинаются с 0.
+15. score всегда должен быть 1.
+16. explanation должен быть осмысленным и не пустым.
+17. explanation должен объяснять именно правильный ответ.
+18. Не используй шаблонные explanation вроде "Options", "Explanation", "Краткое объяснение".
+19. Не повторяй одинаковые вопросы.
+
+Правила для type="single":
+20. correct должен содержать ровно один индекс.
+21. Правильный ответ должен быть однозначным.
+22. Правильный ответ должен явно присутствовать среди options.
+23. Не ставь правильный ответ всегда на позицию 0.
+24. Перемешивай варианты так, чтобы правильный ответ мог быть на позиции 0, 1, 2 или 3.
+
+Правила для type="multiple":
+25. correct должен содержать несколько индексов.
+26. Укажи все правильные варианты, а не только часть.
+27. explanation должен перечислять именно все правильные варианты.
+28. explanation не должен включать неправильные варианты как правильные.
+29. options должен содержать не только правильные, но и неправильные варианты.
+30. correct не должен содержать все индексы [0, 1, 2, 3].
+31. В multiple должно быть 2 или 3 правильных ответа, но не 4.
+32. Минимум один вариант должен быть неправильным.
+
+Правила для type="ordering":
+33. correct должен содержать правильный порядок индексов options.
+34. В options должны быть только элементы, которые действительно участвуют в порядке.
+35. Не добавляй лишний вариант, который не входит в правильную последовательность.
+36. Если нельзя составить качественный ordering-вопрос, лучше создай single или multiple.
+37. Перемешивай options.
+38. options НЕ должен быть сразу в правильном порядке.
+39. correct должен показывать правильный порядок индексов после перемешивания.
+40. Не возвращай correct всегда [0, 1, 2, 3].
+Важно:
+41. Пример JSON выше показывает только структуру.
+42. Не копируй correct из примера.
+43. Не возвращай варианты в виде объектов: {{"id": 0, "value": "..."}}.
+44. Каждый элемент options должен быть простой строкой, например: "SELECT".
 
 {title_hint_text}
 Учебный текст:
