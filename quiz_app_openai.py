@@ -19,9 +19,19 @@ class GenerateQuestionsRequest(BaseModel):
     title_hint: Optional[str] = None
 
 
+class QuestionContent(BaseModel):
+    text: str
+
+    @model_validator(mode="after")
+    def validate_content(self):
+        if not self.text or not self.text.strip():
+            raise ValueError("У question.content.text должен быть текст")
+        return self
+
+
 class QuestionItem(BaseModel):
     type: Literal["single", "multiple", "ordering"]
-    text: str
+    content: QuestionContent
     options: List[str]
     correct: List[int]
     score: int = Field(default=1, ge=1, le=5)
@@ -29,9 +39,6 @@ class QuestionItem(BaseModel):
 
     @model_validator(mode="after")
     def validate_question(self):
-        if not self.text or not self.text.strip():
-            raise ValueError("У question.text должен быть текст")
-
         if not self.explanation or not self.explanation.strip():
             raise ValueError("У question.explanation должен быть текст")
 
@@ -42,10 +49,10 @@ class QuestionItem(BaseModel):
             if not isinstance(option, str) or not option.strip():
                 raise ValueError("Каждый option должен быть непустой строкой")
 
-        option_ids = list(range(len(self.options)))
+        option_indexes = list(range(len(self.options)))
 
         for cid in self.correct:
-            if cid not in option_ids:
+            if cid not in option_indexes:
                 raise ValueError(f"correct содержит индекс={cid}, которого нет в options")
 
         if self.type == "single":
@@ -59,6 +66,8 @@ class QuestionItem(BaseModel):
                 raise ValueError("Для type='multiple' должно быть ровно 4 варианта")
             if len(self.correct) < 2:
                 raise ValueError("Для type='multiple' correct должен содержать минимум 2 индекса")
+            if len(self.correct) >= len(self.options):
+                raise ValueError("Для type='multiple' должен быть минимум один неправильный вариант")
 
         elif self.type == "ordering":
             if len(self.options) < 2:
@@ -104,7 +113,7 @@ def bad_explanation(text: str) -> bool:
 
 
 def extract_text_from_stringified_object(value: str) -> str:
-    """Если в text/value случайно пришла строка вида "{'id': 0, 'text': 'SELECT'}", берём только text."""
+    """Если случайно пришла строка вида "{'id': 0, 'text': 'SELECT'}", берём только text/value."""
     if not isinstance(value, str):
         return ""
 
@@ -133,6 +142,15 @@ def extract_text_from_stringified_object(value: str) -> str:
 
 
 def extract_text_from_content(content) -> str:
+    if isinstance(content, dict):
+        value = content.get("text") or content.get("value") or ""
+        if value:
+            return extract_text_from_stringified_object(str(value))
+        return ""
+
+    if isinstance(content, str):
+        return extract_text_from_stringified_object(content)
+
     if not isinstance(content, list):
         return ""
 
@@ -152,17 +170,20 @@ def extract_text_from_content(content) -> str:
 
 
 def extract_question_text(question: dict, fallback_text: str) -> str:
-    if isinstance(question.get("text"), str) and question["text"].strip():
-        return extract_text_from_stringified_object(question["text"])
-
     content_text = extract_text_from_content(question.get("content"))
     if content_text:
         return content_text
 
+    if isinstance(question.get("text"), str) and question["text"].strip():
+        return extract_text_from_stringified_object(question["text"])
+
     return fallback_text
 
 
-def extract_text_from_option(option: dict) -> str:
+def extract_text_from_option(option) -> str:
+    if isinstance(option, str):
+        return extract_text_from_stringified_object(option)
+
     if not isinstance(option, dict):
         return ""
 
@@ -232,6 +253,23 @@ def build_fallback_explanation(q_type: str, repaired_options: list, correct: lis
     return f"Правильный порядок: {' -> '.join(ordered)}." if ordered else "Правильный порядок определён на основе учебного текста."
 
 
+def shuffle_ordering_if_already_ordered(options: list, correct: list) -> tuple[list, list]:
+    """Если ordering пришёл уже в правильном порядке, перемешиваем options и пересчитываем correct."""
+    if len(options) <= 2:
+        return options, correct
+
+    original_order = list(range(len(options)))
+    if correct != original_order:
+        return options, correct
+
+    # Детерминированное перемешивание без random: [0,1,2,3] -> options [1,2,3,0], correct [3,0,1,2]
+    shuffled_old_indexes = original_order[1:] + original_order[:1]
+    shuffled_options = [options[old_idx] for old_idx in shuffled_old_indexes]
+    old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(shuffled_old_indexes)}
+    shuffled_correct = [old_to_new[old_idx] for old_idx in correct]
+    return shuffled_options, shuffled_correct
+
+
 def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -> dict:
     questions = data.get("questions", [])
     repaired_questions = []
@@ -279,7 +317,7 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
                 opt.get("value") or opt.get("text") or f"Вариант {new_id + 1}"
             )
 
-        option_ids = set(range(len(repaired_options)))
+        option_indexes = set(range(len(repaired_options)))
 
         correct = q.get("correct")
         if not isinstance(correct, list):
@@ -291,7 +329,7 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
                 c_int = int(c)
                 if c_int in old_id_to_new_id:
                     normalized_correct.append(old_id_to_new_id[c_int])
-                elif c_int in option_ids:
+                elif c_int in option_indexes:
                     normalized_correct.append(c_int)
             except Exception:
                 pass
@@ -327,13 +365,13 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
                 correct = [0] if repaired_options else [0]
 
         elif q_type == "multiple":
-            if len(explanation_based_correct) >= 2:
+            if 2 <= len(explanation_based_correct) < len(repaired_options):
                 correct = explanation_based_correct
             elif len(correct) < 2:
-                if len(repaired_options) >= 2:
-                    correct = [0, 1]
-                elif len(repaired_options) == 1:
-                    correct = [0]
+                correct = [0, 1] if len(repaired_options) >= 2 else [0]
+            elif len(correct) >= len(repaired_options):
+                # Чтобы multiple не был с правильными всеми вариантами, оставляем первые 3 индекса.
+                correct = list(range(min(3, len(repaired_options))))
 
         elif q_type == "ordering":
             if len(correct) != len(repaired_options):
@@ -351,12 +389,14 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
                 else:
                     correct = list(range(len(repaired_options)))
 
+            repaired_options, correct = shuffle_ordering_if_already_ordered(repaired_options, correct)
+
         if bad_explanation(explanation):
             explanation = build_fallback_explanation(q_type, repaired_options, correct)
 
         repaired_questions.append({
             "type": q_type,
-            "text": question_text,
+            "content": {"text": question_text},
             "options": repaired_options,
             "correct": correct,
             "score": score,
@@ -367,7 +407,7 @@ def repair_generated_questions(data: dict, quiz_id: int, questions_count: int) -
         idx = len(repaired_questions) + 1
         repaired_questions.append({
             "type": "single",
-            "text": f"Вопрос {idx}",
+            "content": {"text": f"Вопрос {idx}"},
             "options": [
                 "Вариант 1",
                 "Вариант 2",
@@ -411,17 +451,19 @@ class OpenAIQuestionService:
 {{
   "questions": [
     {{
-      "type": "single",
-      "text": "Текст вопроса",
+      "type": "multiple",
+      "content": {{
+        "text": "Какие из перечисленных СУБД являются реляционными? (несколько ответов)"
+      }},
       "options": [
-        "Вариант 1",
-        "Вариант 2",
-        "Вариант 3",
-        "Вариант 4"
+        "MySQL",
+        "PostgreSQL",
+        "MongoDB",
+        "Oracle Database"
       ],
-      "correct": [1],
+      "correct": [0, 1, 3],
       "score": 1,
-      "explanation": "Осмысленное объяснение правильного ответа"
+      "explanation": "MySQL, PostgreSQL и Oracle Database являются реляционными СУБД, а MongoDB относится к NoSQL базам данных."
     }}
   ]
 }}
@@ -433,51 +475,54 @@ class OpenAIQuestionService:
 4. Не придумывай факты, которых нет в учебном тексте.
 5. Не используй абсурдные, случайные или слишком очевидно неправильные варианты.
 6. Не смешивай языки.
-7. Не используй поля content, value, lang, url, alt.
+7. Не используй поля lang, url, alt.
 8. Не используй Tiptap-структуру.
-9. Для текста вопроса используй только поле "text".
-10. options должен быть массивом строк.
-11. Не используй id, text или value внутри options.
-12. У каждого single/multiple вопроса должно быть ровно 4 варианта ответа.
-13. correct должен содержать индексы правильных вариантов из массива options.
-14. Индексы в correct начинаются с 0.
-15. score всегда должен быть 1.
-16. explanation должен быть осмысленным и не пустым.
-17. explanation должен объяснять именно правильный ответ.
-18. Не используй шаблонные explanation вроде "Options", "Explanation", "Краткое объяснение".
-19. Не повторяй одинаковые вопросы.
+9. Для текста вопроса используй только объект "content": {{"text": "..."}}.
+10. Не используй поле question.text.
+11. content должен быть объектом, а не массивом.
+12. options должен быть массивом строк.
+13. Не используй id, text или value внутри options.
+14. У каждого single/multiple вопроса должно быть ровно 4 варианта ответа.
+15. correct должен содержать индексы правильных вариантов из массива options.
+16. Индексы в correct начинаются с 0.
+17. score всегда должен быть 1.
+18. explanation должен быть осмысленным и не пустым.
+19. explanation должен объяснять именно правильный ответ.
+20. Не используй шаблонные explanation вроде "Options", "Explanation", "Краткое объяснение".
+21. Не повторяй одинаковые вопросы.
 
 Правила для type="single":
-20. correct должен содержать ровно один индекс.
-21. Правильный ответ должен быть однозначным.
-22. Правильный ответ должен явно присутствовать среди options.
-23. Не ставь правильный ответ всегда на позицию 0.
-24. Перемешивай варианты так, чтобы правильный ответ мог быть на позиции 0, 1, 2 или 3.
+22. correct должен содержать ровно один индекс.
+23. Правильный ответ должен быть однозначным.
+24. Правильный ответ должен явно присутствовать среди options.
+25. Не ставь правильный ответ всегда на позицию 0.
+26. Перемешивай варианты так, чтобы правильный ответ мог быть на позиции 0, 1, 2 или 3.
 
 Правила для type="multiple":
-25. correct должен содержать несколько индексов.
-26. Укажи все правильные варианты, а не только часть.
-27. explanation должен перечислять именно все правильные варианты.
-28. explanation не должен включать неправильные варианты как правильные.
-29. options должен содержать не только правильные, но и неправильные варианты.
-30. correct не должен содержать все индексы [0, 1, 2, 3].
-31. В multiple должно быть 2 или 3 правильных ответа, но не 4.
-32. Минимум один вариант должен быть неправильным.
+27. correct должен содержать несколько индексов.
+28. Укажи все правильные варианты, а не только часть.
+29. explanation должен перечислять именно все правильные варианты.
+30. explanation не должен включать неправильные варианты как правильные.
+31. options должен содержать не только правильные, но и неправильные варианты.
+32. correct не должен содержать все индексы [0, 1, 2, 3].
+33. В multiple должно быть 2 или 3 правильных ответа, но не 4.
+34. Минимум один вариант должен быть неправильным.
 
 Правила для type="ordering":
-33. correct должен содержать правильный порядок индексов options.
-34. В options должны быть только элементы, которые действительно участвуют в порядке.
-35. Не добавляй лишний вариант, который не входит в правильную последовательность.
-36. Если нельзя составить качественный ordering-вопрос, лучше создай single или multiple.
-37. Перемешивай options.
-38. options НЕ должен быть сразу в правильном порядке.
-39. correct должен показывать правильный порядок индексов после перемешивания.
-40. Не возвращай correct всегда [0, 1, 2, 3].
+35. correct должен содержать правильный порядок индексов options.
+36. В options должны быть только элементы, которые действительно участвуют в порядке.
+37. Не добавляй лишний вариант, который не входит в правильную последовательность.
+38. Если нельзя составить качественный ordering-вопрос, лучше создай single или multiple.
+39. Перемешивай options.
+40. options НЕ должен быть сразу в правильном порядке.
+41. correct должен показывать правильный порядок индексов после перемешивания.
+42. Не возвращай correct всегда [0, 1, 2, 3].
+
 Важно:
-41. Пример JSON выше показывает только структуру.
-42. Не копируй correct из примера.
-43. Не возвращай варианты в виде объектов: {{"id": 0, "value": "..."}}.
-44. Каждый элемент options должен быть простой строкой, например: "SELECT".
+43. Пример JSON выше показывает только структуру.
+44. Не копируй correct из примера.
+45. Не возвращай варианты в виде объектов: {{"id": 0, "value": "..."}}.
+46. Каждый элемент options должен быть простой строкой, например: "SELECT".
 
 {title_hint_text}
 Учебный текст:
